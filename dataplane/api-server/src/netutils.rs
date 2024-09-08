@@ -15,13 +15,20 @@ use netlink_packet_route::{
 use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 use std::net::Ipv4Addr;
 
+const ERR_NO_IFINDEX: &str = "no ifindex found to route";
+const ERR_PACKET_CONSTRUCTION: &str = "construct packet failed";
+
 /// Returns an network interface index for a Ipv4 address (like the command `ip route get to $IP`)
 pub fn if_index_for_routing_ip(ip_addr: Ipv4Addr) -> Result<u32, Error> {
     let mut socket = Socket::new(NETLINK_ROUTE)?;
-    let _port_number = socket.bind_auto()?.port_number();
+    socket.bind_auto()?;
     socket.connect(&SocketAddr::new(0, 0))?;
 
     let mut nl_hdr = NetlinkHeader::default();
+
+    // NNLM_F_REQUEST: Must be set on all request messages (typically from user space to kernel
+    // space)
+    // NLM_F_DUMP_FILTERED: Dump was filtered as requested (to filter dst ipv4)
     nl_hdr.flags = NLM_F_REQUEST | NLM_F_DUMP_FILTERED;
 
     // construct RouteMessage
@@ -37,9 +44,7 @@ pub fn if_index_for_routing_ip(ip_addr: Ipv4Addr) -> Result<u32, Error> {
     route_message.attributes = vec![route_attribute];
     route_message.header = route_header;
 
-    let no_ifindex_err = format!("no ifindex found to route {}", ip_addr);
-    let con_packet_err = "construct packet failed".to_string();
-
+    // construct a message packet for netlink and serialize it to send it over the socket
     let mut packet = NetlinkMessage::new(
         nl_hdr,
         NetlinkPayload::from(RouteNetlinkMessage::GetRoute(route_message)),
@@ -48,30 +53,46 @@ pub fn if_index_for_routing_ip(ip_addr: Ipv4Addr) -> Result<u32, Error> {
     let mut buf = vec![0; packet.header.length as usize];
     // check packet
     if buf.len() != packet.buffer_len() {
-        return Err(Error::msg(con_packet_err));
+        return Err(Error::msg(ERR_PACKET_CONSTRUCTION));
     }
     packet.serialize(&mut buf[..]);
+
+    // send the serialized netlink message packet over the socket
     socket.send(&buf[..], 0)?;
 
-    let mut receive_buffer = vec![0; 4096];
-    socket.recv(&mut &mut receive_buffer[..], 0)?;
+    // The size of the reply is always 104 bytes in local test. (get "only one" route and the reply message_type is 24)
+    // layer(bytes):
+    //   netlink_message_header(16) + route_message_header(12) + route_message_attributes(76)
+    // but The length of route_message_attributes is not fixed.
+    // while ensuring space efficiency, adapt to the maximum payload size of the packet as much as possible.
+    let mut receive_buffer = vec![0; 1024];
+    let mut offset = 0;
+    if let Ok(size) = socket.recv(&mut &mut receive_buffer[..], 0) {
+        loop {
+            let bytes = &receive_buffer[offset..];
+            let rx_packet = <NetlinkMessage<RouteNetlinkMessage>>::deserialize(bytes)?;
 
-    let bytes = &receive_buffer[..];
-
-    // extract returned RouteNetLinkMessage
-    let (_, payload) = <NetlinkMessage<RouteNetlinkMessage>>::deserialize(bytes)?.into_parts();
-    match payload {
-        NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(v)) => {
-            if let Some(RouteAttribute::Oif(idex_if)) = v
-                .attributes
-                .iter()
-                .find(|attr| matches!(attr, RouteAttribute::Oif(_)))
+            // extract returned RouteNetLinkMessage
+            // message type is 24 which is defined as "add_route"(NewRoute) in request
+            // no matter if it's the message type returned by the ip command or this `netlink` crate,
+            // it looks strange.
+            if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(message)) =
+                rx_packet.payload
             {
-                return Ok(*idex_if);
+                if let Some(RouteAttribute::Oif(idex_if)) = message
+                    .attributes
+                    .iter()
+                    .find(|attr| matches!(attr, RouteAttribute::Oif(_)))
+                {
+                    return Ok(*idex_if);
+                }
             }
-            Err(Error::msg(no_ifindex_err.clone()))
-        }
 
-        _ => Err(Error::msg(no_ifindex_err)),
+            offset += rx_packet.header.length as usize;
+            if offset >= size || rx_packet.header.length == 0 {
+                Err(Error::msg(format!("{} {}", ERR_NO_IFINDEX, ip_addr)))
+            }
+        }
     }
+    Err(Error::msg(format!("{} {}", ERR_NO_IFINDEX, ip_addr)))
 }
